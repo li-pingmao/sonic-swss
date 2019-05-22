@@ -23,6 +23,7 @@
 #include "crmorch.h"
 #include "countercheckorch.h"
 #include "notifier.h"
+#include "redisclient.h"
 
 extern sai_switch_api_t *sai_switch_api;
 extern sai_bridge_api_t *sai_bridge_api;
@@ -1432,6 +1433,7 @@ bool PortsOrch::addPort(const set<int> &lane_set, uint32_t speed, int an, string
     }
 
     m_portListLaneMap[lane_set] = port_id;
+    m_portCount++;
 
     SWSS_LOG_NOTICE("Create port %" PRIx64 " with the speed %u", port_id, speed);
 
@@ -1449,13 +1451,16 @@ bool PortsOrch::removePort(sai_object_id_t port_id)
         notify(SUBJECT_TYPE_PORT_CHANGE, static_cast<void *>(&update));
     }
 
+    removeAclTableGroup(p);
+
     sai_status_t status = sai_port_api->remove_port(port_id);
     if (status != SAI_STATUS_SUCCESS)
     {
         SWSS_LOG_ERROR("Failed to remove port %" PRIx64 ", rv:%d", port_id, status);
         return false;
     }
-    removeAclTableGroup(p);
+
+    m_portCount--;
     SWSS_LOG_NOTICE("Remove port %" PRIx64, port_id);
 
     return true;
@@ -1550,6 +1555,25 @@ bool PortsOrch::initPort(const string &alias, const set<int> &lane_set)
     return true;
 }
 
+void PortsOrch::deInitPort(string alias, sai_object_id_t port_id)
+{
+    SWSS_LOG_ENTER();
+
+    Port p(alias, Port::PHY);
+    p.m_port_id = port_id;
+
+    /* remove port name map from counter table */
+    RedisClient redisClient(m_counter_db.get());
+    redisClient.hdel(COUNTERS_PORT_NAME_MAP, alias);
+
+    /* remove port from flex_counter_table for updating counters  */
+    string key = getPortFlexCounterTableKey(sai_serialize_object_id(port_id));
+    m_flexCounterTable->del(key);
+
+    SWSS_LOG_NOTICE("De-Initialized port %s", alias.c_str());
+}
+
+
 bool PortsOrch::bake()
 {
     SWSS_LOG_ENTER();
@@ -1615,6 +1639,37 @@ void PortsOrch::cleanPortTable(const vector<string>& keys)
         m_portTable->del(key);
     }
 }
+
+void PortsOrch::removePortFromLanesMap(string alias)
+{
+
+    for (auto it = m_lanesAliasSpeedMap.begin(); it != m_lanesAliasSpeedMap.end();)
+    {
+        if (get<0>(it->second) == alias)
+        {
+            SWSS_LOG_NOTICE("Removing port %s from lanes map", alias.c_str());
+            it = m_lanesAliasSpeedMap.erase(it);
+            break;
+        }
+        it++;
+    }
+}
+
+void PortsOrch::removePortFromPortListMap(sai_object_id_t port_id)
+{
+
+    for (auto it = m_portListLaneMap.begin(); it != m_portListLaneMap.end();)
+    {
+        if (it->second == port_id)
+        {
+            SWSS_LOG_NOTICE("Removing port-id %lx from port list map", port_id);
+            it = m_portListLaneMap.erase(it);
+            break;
+        }
+        it++;
+    }
+}
+
 
 void PortsOrch::doPortTask(Consumer &consumer)
 {
@@ -1776,7 +1831,7 @@ void PortsOrch::doPortTask(Consumer &consumer)
              * 2. Create new ports
              * 3. Initialize all ports
              */
-            if (m_portConfigState == PORT_CONFIG_RECEIVED && (m_lanesAliasSpeedMap.size() == m_portCount))
+            if (m_portConfigState == PORT_CONFIG_RECEIVED)
             {
                 for (auto it = m_portListLaneMap.begin(); it != m_portListLaneMap.end();)
                 {
@@ -1819,7 +1874,7 @@ void PortsOrch::doPortTask(Consumer &consumer)
                         }
                     }
 
-                    it = m_lanesAliasSpeedMap.erase(it);
+                    it++;
                 }
 
                 m_portConfigState = PORT_CONFIG_DONE;
@@ -2108,9 +2163,30 @@ void PortsOrch::doPortTask(Consumer &consumer)
                 }
             }
         }
-        else
+        else if (op == DEL_COMMAND)
         {
-            SWSS_LOG_ERROR("Unknown operation type %s", op.c_str());
+            SWSS_LOG_NOTICE("Deleting Port %s", alias.c_str());
+            auto port_id = m_portList[alias].m_port_id;
+            auto hif_id = m_portList[alias].m_hif_id;
+
+            deInitPort(alias, port_id);
+
+            SWSS_LOG_NOTICE("Removing hostif %lx for Port %s", hif_id, alias.c_str());
+            sai_status_t status = sai_hostif_api->remove_hostif(hif_id);
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                throw runtime_error("Remove hostif for the port failed");
+            }
+
+            if (!removePort(port_id))
+            {
+                throw runtime_error("Delete port failed");
+            }
+            removePortFromLanesMap(alias);
+            removePortFromPortListMap(port_id);
+
+            /* Delete port from port list */
+            m_portList.erase(alias);
         }
 
         it = consumer.m_toSync.erase(it);
