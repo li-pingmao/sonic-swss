@@ -149,7 +149,7 @@ private:
     map<string, uint32_t> m_port_ref_count;
     unordered_set<string> m_pendingPortSet;
 
-	
+
     NotificationConsumer* m_portStatusNotificationConsumer;
 
     void doTask(Consumer &consumer);
@@ -230,6 +230,8 @@ private:
                                 vector<uint32_t> &serdes_val);
     bool getSaiAclBindPointType(Port::Type                type,
 		                sai_acl_bind_point_type_t &sai_acl_bind_type);
+
+    void flushFDBEntries(sai_object_id_t bridge_port_id);
 };
 #endif /* SWSS_PORTSORCH_H */
 
